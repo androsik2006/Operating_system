@@ -1,6 +1,4 @@
 #include "libcaesar.h"
-
-// Ключ хранится внутри библиотеки
 static char global_key = 0;
 
 void set_key(char key) {
@@ -8,10 +6,12 @@ void set_key(char key) {
 }
 
 void caesar(void* src, void* dst, int len) {
+    if (!src || !dst || len <= 0) return;
+    
     unsigned char* s = (unsigned char*)src;
     unsigned char* d = (unsigned char*)dst;
-    
+
     for (int i = 0; i < len; i++) {
-        d[i] = s[i] ^ global_key;
+        d[i] = s[i] ^ (unsigned char)global_key;
     }
 }

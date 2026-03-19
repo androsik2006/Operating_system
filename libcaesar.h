@@ -12,5 +12,4 @@ void caesar(void* src, void* dst, int len);
 }
 #endif
 
-#endif
-
+#endif /* LIBCAESAR_H */

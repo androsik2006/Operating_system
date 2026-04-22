@@ -49,6 +49,7 @@ void (*lib_caesar)(void*, void*, int);
 
 // Обработчик сигнала SIGINT
 void sigint_handler(int sig) {
+    (void)sig;
     keep_running = 0;
 }
 
@@ -145,7 +146,8 @@ typedef struct {
 } WorkerArg;
 
 void* worker_thread(void* arg) {
-    WorkerArg* warg = (WorkerArg*)arg;
+    //WorkerArg* warg = (WorkerArg*)arg;
+    (void)arg;
     FileTask task;
     
     while (keep_running) {

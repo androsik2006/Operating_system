@@ -30,9 +30,9 @@ test: $(LIB_NAME) $(TEST_PROG) $(THREAD_PROG)
 	# Тестирование test_loader
 	@echo ""
 	@echo "=== Тестирование test_loader ==="
-	./$(TEST_PROG) $(LIB_NAME) 65 input.txt output.txt
+	./$(TEST_PROG) ./$(LIB_NAME) 65 input.txt output.txt
 	@echo "Зашифровано: output.txt"
-	./$(TEST_PROG) $(LIB_NAME) 65 output.txt decrypted.txt
+	./$(TEST_PROG) ./$(LIB_NAME) 65 output.txt decrypted.txt
 	@echo "Расшифровано: decrypted.txt"
 	@echo "Результат:"
 	cat decrypted.txt
@@ -40,21 +40,24 @@ test: $(LIB_NAME) $(TEST_PROG) $(THREAD_PROG)
 	# Тестирование последовательного режима
 	@echo ""
 	@echo "=== Последовательный режим (3 файла) ==="
-	time ./$(THREAD_PROG) $(LIB_NAME) 65 --mode=sequential test_file_1.txt test_file_2.txt test_file_3.txt
+	./$(THREAD_PROG) ./$(LIB_NAME) 65 --mode=sequential test_file_1.txt test_file_2.txt test_file_3.txt
 	
 	# Тестирование параллельного режима
 	@echo ""
 	@echo "=== Параллельный режим (10 файлов) ==="
-	time ./$(THREAD_PROG) $(LIB_NAME) 65 --mode=parallel test_file_1.txt test_file_2.txt test_file_3.txt test_file_4.txt test_file_5.txt test_file_6.txt test_file_7.txt test_file_8.txt test_file_9.txt test_file_10.txt
+	./$(THREAD_PROG) ./$(LIB_NAME) 65 --mode=parallel test_file_1.txt test_file_2.txt test_file_3.txt test_file_4.txt test_file_5.txt test_file_6.txt test_file_7.txt test_file_8.txt test_file_9.txt test_file_10.txt
 	
 	# Тестирование автоматического режима
 	@echo ""
 	@echo "=== Автоматический режим (3 файла - будет sequential) ==="
-	./$(THREAD_PROG) $(LIB_NAME) 65 --mode=auto test_file_1.txt test_file_2.txt test_file_3.txt
+	./$(THREAD_PROG) ./$(LIB_NAME) 65 --mode=auto test_file_1.txt test_file_2.txt test_file_3.txt
 	
 	@echo ""
 	@echo "=== Автоматический режим (10 файлов - будет parallel) ==="
-	./$(THREAD_PROG) $(LIB_NAME) 65 --mode=auto test_file_1.txt test_file_2.txt test_file_3.txt test_file_4.txt test_file_5.txt test_file_6.txt test_file_7.txt test_file_8.txt test_file_9.txt test_file_10.txt
+	./$(THREAD_PROG) ./$(LIB_NAME) 65 --mode=auto test_file_1.txt test_file_2.txt test_file_3.txt test_file_4.txt test_file_5.txt test_file_6.txt test_file_7.txt test_file_8.txt test_file_9.txt test_file_10.txt
+	
+	@echo ""
+	@echo "=== Все тесты завершены! ==="
 
 clean:
 	rm -f $(LIB_NAME) $(TEST_PROG) $(THREAD_PROG)

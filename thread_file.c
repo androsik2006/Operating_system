@@ -44,8 +44,10 @@ Statistics stats_sequential;
 Statistics stats_parallel;
 
 // Функции библиотеки (будут загружены динамически)
+int (*lib_init_secure_key)(void);
 void (*lib_set_key)(char);
 void (*lib_caesar)(void*, void*, int);
+void (*lib_clear_key)(void);
 
 // Обработчик сигнала SIGINT
 void sigint_handler(int sig) {
@@ -75,20 +77,20 @@ void queue_push(FileQueue* q, FileTask task) {
 // Получение задачи из очереди
 int queue_pop(FileQueue* q, FileTask* task) {
     pthread_mutex_lock(&q->mutex);
-    
+
     while (q->count == 0 && keep_running) {
         pthread_cond_wait(&q->not_empty, &q->mutex);
     }
-    
+
     if (!keep_running && q->count == 0) {
         pthread_mutex_unlock(&q->mutex);
         return 0;
     }
-    
+
     *task = q->tasks[q->head];
     q->head = (q->head + 1) % 100;
     q->count--;
-    
+
     pthread_mutex_unlock(&q->mutex);
     return 1;
 }
@@ -108,25 +110,31 @@ void process_file(const char* input_path, const char* output_path, char key) {
         perror("fopen input");
         return;
     }
-    
+
     fseek(fin, 0, SEEK_END);
     long len = ftell(fin);
     fseek(fin, 0, SEEK_SET);
-    
+
     void* buffer = malloc(len);
     if (!buffer) {
         perror("malloc");
         fclose(fin);
         return;
     }
-    
+
     fread(buffer, 1, len, fin);
     fclose(fin);
-    
+
     // Шифрование
-    lib_set_key(key);
-    lib_caesar(buffer, buffer, len);
-    
+    if (lib_set_key) {
+        lib_set_key(key);
+        lib_caesar(buffer, buffer, len);
+    } else {
+        fprintf(stderr, "Функция set_key не загружена\n");
+        free(buffer);
+        return;
+    }
+
     // Запись файла
     FILE* fout = fopen(output_path, "wb");
     if (!fout) {
@@ -134,7 +142,7 @@ void process_file(const char* input_path, const char* output_path, char key) {
         free(buffer);
         return;
     }
-    
+
     fwrite(buffer, 1, len, fout);
     fclose(fout);
     free(buffer);
@@ -146,18 +154,17 @@ typedef struct {
 } WorkerArg;
 
 void* worker_thread(void* arg) {
-    //WorkerArg* warg = (WorkerArg*)arg;
     (void)arg;
     FileTask task;
-    
+
     while (keep_running) {
         if (!queue_pop(&queue, &task)) {
             break;
         }
-        
+
         process_file(task.input_path, task.output_path, task.key);
     }
-    
+
     return NULL;
 }
 
@@ -165,27 +172,27 @@ void* worker_thread(void* arg) {
 void run_sequential(char** files, int file_count, char key) {
     printf("\n=== ПОСЛЕДОВАТЕЛЬНЫЙ РЕЖИМ ===\n");
     printf("Обработка %d файлов...\n", file_count);
-    
+
     double start_time = get_time();
-    
+
     for (int i = 0; i < file_count; i++) {
         char output_path[256];
         snprintf(output_path, sizeof(output_path), "encrypted_%s", files[i]);
-        
+
         double file_start = get_time();
         process_file(files[i], output_path, key);
         double file_end = get_time();
-        
-        printf("Файл %d: %s -> %s (%.3f сек)\n", 
+
+        printf("Файл %d: %s -> %s (%.3f сек)\n",
                i + 1, files[i], output_path, file_end - file_start);
     }
-    
+
     double end_time = get_time();
-    
+
     stats_sequential.total_time = end_time - start_time;
     stats_sequential.avg_time_per_file = stats_sequential.total_time / file_count;
     stats_sequential.files_processed = file_count;
-    
+
     printf("\n--- Статистика (последовательный режим) ---\n");
     printf("Всего файлов: %d\n", file_count);
     printf("Общее время: %.3f сек\n", stats_sequential.total_time);
@@ -196,46 +203,53 @@ void run_sequential(char** files, int file_count, char key) {
 void run_parallel(char** files, int file_count, char key) {
     printf("\n=== ПАРАЛЛЕЛЬНЫЙ РЕЖИМ ===\n");
     printf("Обработка %d файлов в %d потоков...\n", file_count, WORKERS_COUNT);
-    
+
     queue_init(&queue);
-    
+
     // Создание потоков
     pthread_t workers[WORKERS_COUNT];
     WorkerArg args[WORKERS_COUNT];
-    
+
     for (int i = 0; i < WORKERS_COUNT; i++) {
         args[i].id = i;
         pthread_create(&workers[i], NULL, worker_thread, &args[i]);
     }
-    
+
     // Добавление задач в очередь
     for (int i = 0; i < file_count; i++) {
         FileTask task;
         snprintf(task.input_path, sizeof(task.input_path), "%s", files[i]);
         snprintf(task.output_path, sizeof(task.output_path), "encrypted_%s", files[i]);
         task.key = key;
-        
+
         queue_push(&queue, task);
     }
-    
-    // Ожидание завершения всех задач
-    while (queue.count > 0) {
+
+    // Ожидание завершения всех задач или прерывания
+    while (keep_running && (queue.count > 0 || queue.head != queue.tail)) {
         usleep(10000); // 10 мс
     }
-    
+
     // Остановка потоков
     keep_running = 0;
     pthread_cond_broadcast(&queue.not_empty);
     
-    // Ожидание завершения потоков
+    // Ожидание завершения потоков с таймаутом
     for (int i = 0; i < WORKERS_COUNT; i++) {
         pthread_join(workers[i], NULL);
     }
-    
+
+    double end_time = get_time();
+
+    stats_parallel.total_time = end_time - start_time;
+    stats_parallel.avg_time_per_file = stats_parallel.total_time / file_count;
+    stats_parallel.files_processed = file_count;
+
     printf("\n--- Статистика (параллельный режим) ---\n");
     printf("Всего файлов: %d\n", file_count);
     printf("Потоков: %d\n", WORKERS_COUNT);
-    printf("Обработано файлов: %d\n", file_count);
+    printf("Общее время: %.3f сек\n", stats_parallel.total_time);
+    printf("Среднее время на файл: %.3f сек\n", stats_parallel.avg_time_per_file);
 }
 
 // Вывод сравнительной таблицы
@@ -244,8 +258,10 @@ void print_comparison() {
     printf("--------------------------------------------------\n");
     printf("| %-15s | %-12s | %-12s |\n", "Режим", "Время (сек)", "Ср. на файл");
     printf("--------------------------------------------------\n");
-    printf("| %-15s | %-12.3f | %-12.3f |\n", 
+    printf("| %-15s | %-12.3f | %-12.3f |\n",
            "Sequential", stats_sequential.total_time, stats_sequential.avg_time_per_file);
+    printf("| %-15s | %-12.3f | %-12.3f |\n",
+           "Parallel", stats_parallel.total_time, stats_parallel.avg_time_per_file);
     printf("--------------------------------------------------\n");
 }
 
@@ -256,23 +272,25 @@ void* load_library(const char* lib_path) {
         fprintf(stderr, "Ошибка при загрузке библиотеки: %s\n", dlerror());
         return NULL;
     }
-    
+
+    lib_init_secure_key = (int (*)(void))dlsym(handle, "init_secure_key");
     lib_set_key = (void (*)(char))dlsym(handle, "set_key");
     lib_caesar = (void (*)(void*, void*, int))dlsym(handle, "caesar");
-    
-    if (!lib_set_key || !lib_caesar) {
+    lib_clear_key = (void (*)(void))dlsym(handle, "clear_key");
+
+    if (!lib_init_secure_key || !lib_set_key || !lib_caesar || !lib_clear_key) {
         fprintf(stderr, "Ошибка при поиске символов: %s\n", dlerror());
         dlclose(handle);
         return NULL;
     }
-    
+
     return handle;
 }
 
 int main(int argc, char* argv[]) {
     // Регистрация обработчика сигнала
     signal(SIGINT, sigint_handler);
-    
+
     // Проверка аргументов
     if (argc < 5) {
         fprintf(stderr, "Использование:\n");
@@ -280,17 +298,24 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "  mode: --mode=sequential | --mode=parallel | --mode=auto\n");
         return 1;
     }
-    
+
     const char* lib_path = argv[1];
     char key = (char)atoi(argv[2]);
     const char* mode_str = argv[3];
-    
+
     // Загрузка библиотеки
     void* handle = load_library(lib_path);
     if (!handle) {
         return 1;
     }
-    
+
+    // Инициализация защищённой области для ключа
+    if (lib_init_secure_key() < 0) {
+        fprintf(stderr, "Ошибка при инициализации защищённой области для ключа\n");
+        dlclose(handle);
+        return 1;
+    }
+
     // Определение режима
     enum { SEQUENTIAL, PARALLEL, AUTO } mode;
     if (strcmp(mode_str, "--mode=sequential") == 0) {
@@ -301,18 +326,20 @@ int main(int argc, char* argv[]) {
         mode = AUTO;
     } else {
         fprintf(stderr, "Неверный режим: %s\n", mode_str);
+        dlclose(handle);
+        lib_clear_key();
         return 1;
     }
-    
+
     // Получение списка файлов
     int file_count = argc - 4;
     char** files = &argv[4];
-    
+
     printf("\n=== ШИФРОВАНИЕ ФАЙЛОВ ===\n");
     printf("Библиотека: %s\n", lib_path);
     printf("Ключ: %d\n", key);
     printf("Файлов: %d\n", file_count);
-    
+
     // Автоматический выбор режима
     if (mode == AUTO) {
         if (file_count < 5) {
@@ -323,19 +350,29 @@ int main(int argc, char* argv[]) {
             printf("Автоматический выбор: параллельный режим (>= 5 файлов)\n");
         }
     }
-    
+
     // Запуск выбранного режима
+    double start_time = get_time();
     if (mode == SEQUENTIAL) {
         run_sequential(files, file_count, key);
     } else {
         run_parallel(files, file_count, key);
     }
-    
-    // Вывод сравнительной статистики (если нужно)
-    // print_comparison();
-    
+
+    // Вывод сравнительной статистики
+    print_comparison();
+
+    // Безопасное удаление ключа из памяти
+    if (lib_clear_key) {
+        lib_clear_key();
+    }
+
     dlclose(handle);
-    
+
+    // Деинициализация мьютекса и условия
+    pthread_mutex_destroy(&queue.mutex);
+    pthread_cond_destroy(&queue.not_empty);
+
     printf("\nГотово!\n");
     return 0;
 }

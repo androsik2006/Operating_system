@@ -1,78 +1,86 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -pedantic -fPIC -pthread -lrt -D_GNU_SOURCE
-LIB_NAME = libcaesar.so
-TEST_PROG = test_loader
-THREAD_PROG = secure_copy
-SECURE_PROG = secure_key_manager
+CFLAGS = -Wall -Wextra -pedantic -fPIC -pthread -D_GNU_SOURCE
+LDFLAGS = -lrt
+FUSE_CFLAGS = $(shell pkg-config fuse3 --cflags)
+FUSE_LDFLAGS = $(shell pkg-config fuse3 --libs)
+LIB_NAME = librc4_container.so
+CONTAINER_PROG = container_tool
+FUSE_PROG = fuse_reader
+TEST_PROG = test_rc4_container
 
-all: $(LIB_NAME) $(TEST_PROG) $(THREAD_PROG) $(SECURE_PROG)
+# Параметры для тестирования
+NUM_TEST_FILES = 10
+MAX_THREADS = 4  # < 5 потоков, как требуется
+TEST_KEY = "my_secret_key"
+TEST_SALT = "16byte_salt_here"
 
-$(LIB_NAME): libcaesar.c
-	$(CC) $(CFLAGS) -shared -o $(LIB_NAME) libcaesar.c
+all: $(LIB_NAME) $(CONTAINER_PROG) $(FUSE_PROG) $(TEST_PROG)
 
-$(TEST_PROG): test_loader.c
-	$(CC) $(CFLAGS) -o $(TEST_PROG) test_loader.c -ldl -pthread
+$(LIB_NAME): rc4_crypto.c container_format.c
+	$(CC) $(CFLAGS) $(FUSE_CFLAGS) -shared -o $@ $^ $(LDFLAGS) $(FUSE_LDFLAGS)
 
-$(THREAD_PROG): thread_file.c
-	$(CC) $(CFLAGS) -o $(THREAD_PROG) thread_file.c -ldl -pthread
+$(CONTAINER_PROG): container_tool.c $(LIB_NAME)
+	$(CC) $(CFLAGS) -o $@ $< -L. -lrc4_container -ldl -pthread $(LDFLAGS)
 
-$(SECURE_PROG): secure_key_storage.c secure_key_storage.h
-	$(CC) $(CFLAGS) -o $(SECURE_PROG) secure_key_storage.c -ldl -pthread
+$(FUSE_PROG): fuse_reader.c $(LIB_NAME)
+	$(CC) $(CFLAGS) $(FUSE_CFLAGS) -o $@ $< -L. -lrc4_container $(LDFLAGS) $(FUSE_LDFLAGS)
 
-install: $(LIB_NAME) $(SECURE_PROG)
+$(TEST_PROG): test_rc4.c $(LIB_NAME)
+	$(CC) $(CFLAGS) -o $@ $< -L. -lrc4_container -ldl -pthread $(LDFLAGS)
+
+install: $(LIB_NAME) $(CONTAINER_PROG) $(FUSE_PROG)
+	@echo "Установка:"
 	sudo cp $(LIB_NAME) /usr/local/lib/
 	sudo ldconfig
-	sudo cp $(SECURE_PROG) /usr/local/bin/
+	sudo cp $(CONTAINER_PROG) /usr/local/bin/
+	sudo cp $(FUSE_PROG) /usr/local/bin/
 
-test: $(LIB_NAME) $(TEST_PROG) $(THREAD_PROG) $(SECURE_PROG)
-	# Создаем тестовые файлы
-	@echo "Создание тестовых файлов..."
-	echo "Привет, студентка МИРЕА" > input.txt
-	for i in 1 2 3 4 5 6 7 8 9 10; do \
-		echo "Тестовый файл номер $$i с некоторым содержимым для шифрования" > test_file_$$i.txt; \
+create_test_files:
+	@echo "Создание тестовых файлов (включая вложенность)..."
+	mkdir -p test_dir/subdir
+	echo "Привет, контейнер с RC4" > input.txt
+	echo "Файл во вложенной директории" > test_dir/subdir/nested_file.txt
+	for i in $(shell seq 1 $(NUM_TEST_FILES)); do \
+		echo "Тестовый файл $$i для контейнера RC4" > test_file_$$i.txt; \
 	done
 
-	# Тестирование test_loader
+test: create_test_files $(LIB_NAME) $(CONTAINER_PROG) $(FUSE_PROG) $(TEST_PROG)
 	@echo ""
-	@echo "=== Тестирование test_loader ==="
-	./$(TEST_PROG) ./$(LIB_NAME) 65 input.txt output.txt
-	@echo "Зашифровано: output.txt"
-	./$(TEST_PROG) ./$(LIB_NAME) 65 output.txt decrypted.txt
-	@echo "Расшифровано: decrypted.txt"
-	@echo "Результат:"
-	cat decrypted.txt
-
-	# Тестирование последовательного режима
-	@echo ""
-	@echo "=== Последовательный режим (3 файла) ==="
-	./$(THREAD_PROG) ./$(LIB_NAME) 65 --mode=sequential test_file_1.txt test_file_2.txt test_file_3.txt
-
-	# Тестирование параллельного режима
-	@echo ""
-	@echo "=== Параллельный режим (10 файлов) ==="
-	./$(THREAD_PROG) ./$(LIB_NAME) 65 --mode=parallel test_file_1.txt test_file_2.txt test_file_3.txt test_file_4.txt test_file_5.txt test_file_6.txt test_file_7.txt test_file_8.txt test_file_9.txt test_file_10.txt
-
-	# Тестирование автоматического режима
-	@echo ""
-	@echo "=== Автоматический режим (3 файла - будет sequential) ==="
-	./$(THREAD_PROG) ./$(LIB_NAME) 65 --mode=auto test_file_1.txt test_file_2.txt test_file_3.txt
+	@echo "=== Тестирование добавления файлов в контейнер (параллельно, <5 потоков) ==="
+	./$(CONTAINER_PROG) --add --threads=$(MAX_THREADS) --key="$(TEST_KEY)" --salt="$(TEST_SALT)" \
+		input.txt test_file_1.txt test_dir/subdir/nested_file.txt output.container
 
 	@echo ""
-	@echo "=== Автоматический режим (10 файлов - будет parallel) ==="
-	./$(THREAD_PROG) ./$(LIB_NAME) 65 --mode=auto test_file_1.txt test_file_2.txt test_file_3.txt test_file_4.txt test_file_5.txt test_file_6.txt test_file_7.txt test_file_8.txt test_file_9.txt test_file_10.txt
+	@echo "=== Просмотр списка файлов в контейнере ==="
+	./$(CONTAINER_PROG) --list output.container
 
-	# Тестирование безопасного хранения ключа
 	@echo ""
-	@echo "=== Тестирование безопасного хранения ключа ==="
-	./$(SECURE_PROG) test_key "Secret123"
-	./$(SECURE_PROG) check_key "Secret123"
-	./$(SECURE_PROG) clear_key
-	@echo "Тестирование безопасного хранения завершено."
+	@echo "=== Чтение файла из контейнера ==="
+	./$(CONTAINER_PROG) --extract --file=input.txt output.container extracted_input.txt
+	@echo "Содержимое извлечённого файла:"
+	cat extracted_input.txt
+
+	@echo ""
+	@echo "=== Тестирование FUSE-монтирования ==="
+	mkdir -p mountpoint
+	./$(FUSE_PROG) output.container mountpoint &
+	sleep 2  # Ждём монтирования
+	@echo "Содержимое через FUSE:"
+	ls -la mountpoint/
+	@echo "Чтение файла через FUSE:"
+	cat mountpoint/input.txt
+	fusermount -u mountpoint
+	rmdir mountpoint
+
+	@echo ""
+	@echo "=== Проверка защиты внутреннего состояния (256 байт) ==="
+	./$(TEST_PROG) verify_internal_state
 
 clean:
-	rm -f $(LIB_NAME) $(TEST_PROG) $(THREAD_PROG) $(SECURE_PROG)
-	rm -f input.txt output.txt decrypted.txt
-	rm -f test_file_*.txt encrypted_test_file_*.txt
-	rm -f key_*.tmp
+	rm -f $(LIB_NAME) $(CONTAINER_PROG) $(FUSE_PROG) $(TEST_PROG)
+	rm -f input.txt output.container extracted_input.txt
+	rm -rf test_dir mountpoint
+	rm -f test_file_*.txt
 
-.PHONY: all install test clean
+
+.PHONY: all install test clean create_test_files

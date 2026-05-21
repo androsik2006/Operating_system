@@ -7,17 +7,24 @@
 #include <dlfcn.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
+
 #include "libcaesar.h"
 
-// Параметры
+// Константы
 #define BUFFER_SIZE 4096
-#define WORKERS_COUNT 4
+#define WORKERS_COUNT 4  // <= 5 потоков, как требуется
+#define MAX_PATH_LEN 1024
+#define SALT_SIZE 16
+#define CONTAINER_MAGIC 0xCAFEBABE
 
 // Структура для файла в очереди
 typedef struct {
-    char input_path[256];
-    char output_path[256];
-    char key;
+    char input_path[MAX_PATH_LEN];
+    char container_path[MAX_PATH_LEN];  // Путь к контейнеру
+    uint8_t key[RC4_KEY_MAX_SIZE];
+    size_t key_len;
+    uint8_t salt[SALT_SIZE];
 } FileTask;
 
 // Структура очереди файлов
@@ -44,10 +51,9 @@ Statistics stats_sequential;
 Statistics stats_parallel;
 
 // Функции библиотеки (будут загружены динамически)
-int (*lib_init_secure_key)(void);
-void (*lib_set_key)(char);
-void (*lib_caesar)(void*, void*, int);
-void (*lib_clear_key)(void);
+secure_rc4_context* (*lib_init_secure_rc4)(const uint8_t*, size_t, const uint8_t*);
+int (*lib_rc4_crypt)(secure_rc4_context*, const void*, void*, size_t);
+void (*lib_clear_secure_rc4)(secure_rc4_context*);
 
 // Обработчик сигнала SIGINT
 void sigint_handler(int sig) {
@@ -102,57 +108,75 @@ double get_time() {
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-// Обработка одного файла
-void process_file(const char* input_path, const char* output_path, char key) {
-    // Чтение файла
+// Безопасное затирание памяти
+void secure_memset(void* ptr, int value, size_t size) {
+    volatile uint8_t* p = (volatile uint8_t*)ptr;
+    while (size--) {
+        *p++ = (uint8_t)value;
+    }
+}
+
+// Обработка одного файла и добавление в контейнер
+int process_file_to_container(const char* input_path, const char* container_path,
+                     const uint8_t* key, size_t key_len, const uint8_t* salt) {
     FILE* fin = fopen(input_path, "rb");
     if (!fin) {
         perror("fopen input");
-        return;
+        return -1;
     }
 
     fseek(fin, 0, SEEK_END);
-    long len = ftell(fin);
+    long file_len = ftell(fin);
     fseek(fin, 0, SEEK_SET);
 
-    void* buffer = malloc(len);
+    void* buffer = malloc(file_len);
     if (!buffer) {
-        perror("malloc");
         fclose(fin);
-        return;
+        return -1;
     }
-
-    fread(buffer, 1, len, fin);
+    fread(buffer, 1, file_len, fin);
     fclose(fin);
 
+    // Инициализация RC4 контекста
+    secure_rc4_context* ctx = lib_init_secure_rc4(key, key_len, salt);
+    if (!ctx) {
+        free(buffer);
+        return -1;
+    }
+
     // Шифрование
-    if (lib_set_key) {
-        lib_set_key(key);
-        lib_caesar(buffer, buffer, len);
-    } else {
-        fprintf(stderr, "Функция set_key не загружена\n");
+    if (lib_rc4_crypt(ctx, buffer, buffer, file_len) != 0) {
+        lib_clear_secure_rc4(ctx);
         free(buffer);
-        return;
+        return -1;
     }
 
-    // Запись файла
-    FILE* fout = fopen(output_path, "wb");
+    // Запись в контейнер с заголовком
+    FILE* fout = fopen(container_path, "ab");  // Добавляем в конец контейнера
     if (!fout) {
-        perror("fopen output");
+        lib_clear_secure_rc4(ctx);
         free(buffer);
-        return;
+        return -1;
     }
 
-    fwrite(buffer, 1, len, fout);
+    // Заголовок: 4 (длина файла) + 4 (длина имени) + 16 (соль) + N (имя)
+    uint32_t name_len = strlen(input_path);
+    fwrite(&file_len, sizeof(uint32_t), 1, fout);
+    fwrite(&name_len, sizeof(uint32_t), 1, fout);
+    fwrite(salt, sizeof(uint8_t), SALT_SIZE, fout);
+    fwrite(input_path, sizeof(char), name_len, fout);
+    fwrite(buffer, sizeof(uint8_t), file_len, fout);
+
     fclose(fout);
+    lib_clear_secure_rc4(ctx);
+
+    // Безопасное затирание буфера перед освобождением
+    secure_memset(buffer, 0, file_len);
     free(buffer);
+    return 0;
 }
 
 // Функция потока-работника для параллельного режима
-typedef struct {
-    int id;
-} WorkerArg;
-
 void* worker_thread(void* arg) {
     (void)arg;
     FileTask task;
@@ -161,30 +185,31 @@ void* worker_thread(void* arg) {
         if (!queue_pop(&queue, &task)) {
             break;
         }
-
-        process_file(task.input_path, task.output_path, task.key);
+        process_file_to_container(task.input_path, task.container_path,
+                              task.key, task.key_len, task.salt);
     }
-
     return NULL;
 }
 
 // Последовательный режим
-void run_sequential(char** files, int file_count, char key) {
+void run_sequential(char** files, int file_count, const uint8_t* key,
+                   size_t key_len, const uint8_t* salt, const char* container_path) {
     printf("\n=== ПОСЛЕДОВАТЕЛЬНЫЙ РЕЖИМ ===\n");
     printf("Обработка %d файлов...\n", file_count);
 
     double start_time = get_time();
 
     for (int i = 0; i < file_count; i++) {
-        char output_path[256];
-        snprintf(output_path, sizeof(output_path), "encrypted_%s", files[i]);
-
         double file_start = get_time();
-        process_file(files[i], output_path, key);
+        int result = process_file_to_container(files[i], container_path, key, key_len, salt);
         double file_end = get_time();
 
-        printf("Файл %d: %s -> %s (%.3f сек)\n",
-               i + 1, files[i], output_path, file_end - file_start);
+        if (result == 0) {
+            printf("Файл %d: %s -> %s (%.3f сек)\n",
+                   i + 1, files[i], container_path, file_end - file_start);
+        } else {
+            printf("Ошибка при обработке файла %s\n", files[i]);
+        }
     }
 
     double end_time = get_time();
@@ -200,7 +225,8 @@ void run_sequential(char** files, int file_count, char key) {
 }
 
 // Параллельный режим с пулом потоков
-void run_parallel(char** files, int file_count, char key) {
+void run_parallel(char** files, int file_count, const uint8_t* key,
+                  size_t key_len, const uint8_t* salt, const char* container_path) {
     printf("\n=== ПАРАЛЛЕЛЬНЫЙ РЕЖИМ ===\n");
     printf("Обработка %d файлов в %d потоков...\n", file_count, WORKERS_COUNT);
 
@@ -208,33 +234,33 @@ void run_parallel(char** files, int file_count, char key) {
 
     // Создание потоков
     pthread_t workers[WORKERS_COUNT];
-    WorkerArg args[WORKERS_COUNT];
 
     for (int i = 0; i < WORKERS_COUNT; i++) {
-        args[i].id = i;
-        pthread_create(&workers[i], NULL, worker_thread, &args[i]);
+        pthread_create(&workers[i], NULL, worker_thread, NULL);
     }
 
     // Добавление задач в очередь
     for (int i = 0; i < file_count; i++) {
         FileTask task;
         snprintf(task.input_path, sizeof(task.input_path), "%s", files[i]);
-        snprintf(task.output_path, sizeof(task.output_path), "encrypted_%s", files[i]);
-        task.key = key;
+        snprintf(task.container_path, sizeof(task.container_path), "%s", container_path);
+        memcpy(task.key, key, key_len);
+        task.key_len = key_len;
+        memcpy(task.salt, salt, SALT_SIZE);
 
         queue_push(&queue, task);
     }
 
-    // Ожидание завершения всех задач или прерывания
-    while (keep_running && (queue.count > 0 || queue.head != queue.tail)) {
-        usleep(10000); // 10 мс
+    // Ожидание завершения всех задач
+    while (keep_running && queue.count > 0) {
+        usleep(1000); // 1 мс
     }
 
     // Остановка потоков
     keep_running = 0;
     pthread_cond_broadcast(&queue.not_empty);
-    
-    // Ожидание завершения потоков с таймаутом
+
+    // Ожидание завершения потоков
     for (int i = 0; i < WORKERS_COUNT; i++) {
         pthread_join(workers[i], NULL);
     }
@@ -273,12 +299,11 @@ void* load_library(const char* lib_path) {
         return NULL;
     }
 
-    lib_init_secure_key = (int (*)(void))dlsym(handle, "init_secure_key");
-    lib_set_key = (void (*)(char))dlsym(handle, "set_key");
-    lib_caesar = (void (*)(void*, void*, int))dlsym(handle, "caesar");
-    lib_clear_key = (void (*)(void))dlsym(handle, "clear_key");
+    lib_init_secure_rc4 = (secure_rc4_context* (*)(const uint8_t*, size_t, const uint8_t*))dlsym(handle, "init_secure_rc4");
+    lib_rc4_crypt = (int (*)(secure_rc4_context*, const void*, void*, size_t))dlsym(handle, "rc4_crypt");
+    lib_clear_secure_rc4 = (void (*)(secure_rc4_context*))dlsym(handle, "clear_secure_rc4");
 
-    if (!lib_init_secure_key || !lib_set_key || !lib_caesar || !lib_clear_key) {
+    if (!lib_init_secure_rc4 || !lib_rc4_crypt || !lib_clear_secure_rc4) {
         fprintf(stderr, "Ошибка при поиске символов: %s\n", dlerror());
         dlclose(handle);
         return NULL;
@@ -292,27 +317,42 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, sigint_handler);
 
     // Проверка аргументов
-    if (argc < 5) {
+    if (argc < 6) {
         fprintf(stderr, "Использование:\n");
-        fprintf(stderr, "  %s <lib_path> <key> <mode> <file1> [file2] ...\n", argv[0]);
+        fprintf(stderr, "  %s <lib_path> <key_hex> <salt_hex> <container_path> <mode> <file1> [file2] ...\n", argv[0]);
         fprintf(stderr, "  mode: --mode=sequential | --mode=parallel | --mode=auto\n");
+        fprintf(stderr, "  key_hex и salt_hex — в шестнадцатеричном формате\n");
         return 1;
     }
 
     const char* lib_path = argv[1];
-    char key = (char)atoi(argv[2]);
-    const char* mode_str = argv[3];
+    const char* key_hex = argv[2];
+    const char* salt_hex = argv[3];
+    const char* container_path = argv[4];
+    const char* mode_str = argv[5];
+
+    // Преобразование ключа и соли из hex
+    uint8_t key[RC4_KEY_MAX_SIZE];
+    size_t key_len = 0;
+    uint8_t salt[SALT_SIZE];
+
+    // Простая функция для преобразования hex-строки в байты
+    int hex_to_bytes(const char* hex, uint8_t* bytes, size_t max_len) {
+        size_t len = strlen(hex) / 2;
+        if (len > max_len) len = max_len;
+
+        for (size_t i = 0; i < len; i++) {
+            sscanf(hex + 2 * i, "%2hhx", &bytes[i]);
+        }
+        return len;
+    }
+
+    key_len = hex_to_bytes(key_hex, key, RC4_KEY_MAX_SIZE);
+    hex_to_bytes(salt_hex, salt, SALT_SIZE);
 
     // Загрузка библиотеки
     void* handle = load_library(lib_path);
     if (!handle) {
-        return 1;
-    }
-
-    // Инициализация защищённой области для ключа
-    if (lib_init_secure_key() < 0) {
-        fprintf(stderr, "Ошибка при инициализации защищённой области для ключа\n");
-        dlclose(handle);
         return 1;
     }
 
@@ -327,52 +367,74 @@ int main(int argc, char* argv[]) {
     } else {
         fprintf(stderr, "Неверный режим: %s\n", mode_str);
         dlclose(handle);
-        lib_clear_key();
         return 1;
     }
 
     // Получение списка файлов
-    int file_count = argc - 4;
-    char** files = &argv[4];
+    int file_count = argc - 6;
+    char** files = &argv[6];
 
-    printf("\n=== ШИФРОВАНИЕ ФАЙЛОВ ===\n");
+    printf("\n=== ШИФРОВАНИЕ ФАЙЛОВ В КОНТЕЙНЕР ===\n");
     printf("Библиотека: %s\n", lib_path);
-    printf("Ключ: %d\n", key);
-    printf("Файлов: %d\n", file_count);
+    printf("Ключ (hex): %s\n", key_hex);
+    printf("Соль (hex): %s\n", salt_hex);
+    printf("Контейнер: %s\n", container_path);
+    printf("Режим: %s\n", mode_str);
+    printf("Файлы для обработки: %d\n", file_count);
 
-    // Автоматический выбор режима
-    if (mode == AUTO) {
-        if (file_count < 5) {
-            mode = SEQUENTIAL;
-            printf("Автоматический выбор: последовательный режим (< 5 файлов)\n");
-        } else {
-            mode = PARALLEL;
-            printf("Автоматический выбор: параллельный режим (>= 5 файлов)\n");
-        }
+    // Очистка контейнера перед записью (если режим не append)
+    FILE* container = fopen(container_path, "wb");
+    if (!container) {
+        fprintf(stderr, "Не удалось создать контейнер: %s\n", container_path);
+        dlclose(handle);
+        return 1;
     }
+    // Запись магического числа в начало контейнера
+    uint32_t magic = CONTAINER_MAGIC;
+    fwrite(&magic, sizeof(uint32_t), 1, container);
+    fclose(container);
 
-    // Запуск выбранного режима
     double start_time = get_time();
-    if (mode == SEQUENTIAL) {
-        run_sequential(files, file_count, key);
-    } else {
-        run_parallel(files, file_count, key);
+
+    switch (mode) {
+        case SEQUENTIAL:
+            run_sequential(files, file_count, key, key_len, salt, container_path);
+            break;
+        case PARALLEL:
+            run_parallel(files, file_count, key, key_len, salt, container_path);
+            break;
+        case AUTO:
+            // Автовыбор режима: если файлов > 10, используем параллельный
+            if (file_count > 10) {
+                printf("Автовыбор: параллельный режим (файлов > 10)\n");
+                run_parallel(files, file_count, key, key_len, salt, container_path);
+            } else {
+                printf("Автовыбор: последовательный режим (файлов <= 10)\n");
+                run_sequential(files, file_count, key, key_len, salt, container_path);
+            }
+            break;
     }
 
-    // Вывод сравнительной статистики
+    double total_end_time = get_time();
+    printf("\n=== ОБЩАЯ СТАТИСТИКА ===\n");
+    printf("Общее время работы программы: %.3f сек\n", total_end_time - start_time);
+
     print_comparison();
 
-    // Безопасное удаление ключа из памяти
-    if (lib_clear_key) {
-        lib_clear_key();
-    }
-
+    // Финальная очистка
     dlclose(handle);
 
-    // Деинициализация мьютекса и условия
-    pthread_mutex_destroy(&queue.mutex);
-    pthread_cond_destroy(&queue.not_empty);
-
-    printf("\nГотово!\n");
+    printf("\nОбработка завершена. Контейнер сохранён: %s\n", container_path);
     return 0;
+}
+
+// Вспомогательная функция для преобразования hex-строки в байты
+int hex_to_bytes(const char* hex, uint8_t* bytes, size_t max_len) {
+    size_t len = strlen(hex) / 2;
+    if (len > max_len) len = max_len;
+
+    for (size_t i = 0; i < len; i++) {
+        sscanf(hex + 2 * i, "%2hhx", &bytes[i]);
+    }
+    return len;
 }

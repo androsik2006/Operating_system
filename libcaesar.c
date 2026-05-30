@@ -3,99 +3,101 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 
-// Безопасное затирание памяти — не оптимизируется компилятором
 void secure_memset(void* ptr, int value, size_t size) {
     volatile uint8_t* p = (volatile uint8_t*)ptr;
-    while (size--) {
-        *p++ = (uint8_t)value;
-    }
+    while (size--) *p++ = (uint8_t)value;
 }
 
-static void* allocate_secure_memory(size_t size) {
-    void* ptr = mmap(
-        NULL,
-        size,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        -1,
-        0
-    );
+static void* allocate_secure_region(size_t size, int prot) {
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    size_t aligned = ((size + ps - 1) / ps) * ps;
+    if (aligned == 0) aligned = (size_t)ps;
+    
+    void* ptr = mmap(NULL, aligned, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (ptr == MAP_FAILED) {
-        fprintf(stderr, "Ошибка выделения защищённой памяти: %s\n", strerror(errno));
+        fprintf(stderr, "mmap failed: %s\n", strerror(errno));
         return NULL;
     }
     return ptr;
 }
 
+static int toggle_protection(void* region, size_t size, int prot) {
+    return mprotect(region, size, prot);
+}
+
 secure_rc4_context* init_secure_rc4(const uint8_t* key, size_t key_len, const uint8_t* salt) {
-    if (!key || key_len == 0 || key_len > RC4_KEY_MAX_SIZE || !salt) {
-        return NULL;
-    }
+    if (!key || key_len == 0 || key_len > RC4_KEY_MAX_SIZE || !salt) return NULL;
 
-    secure_rc4_context* ctx = malloc(sizeof(secure_rc4_context));
+    secure_rc4_context* ctx = calloc(1, sizeof(secure_rc4_context));
     if (!ctx) return NULL;
+    pthread_mutex_init(&ctx->state_mutex, NULL);
 
-    // Выделяем защищённую память для ключа
-    ctx->key = allocate_secure_memory(key_len);
-    if (!ctx->key) {
-        free(ctx);
-        return NULL;
-    }
-    memcpy(ctx->key, key, key_len);
+    // Ключ
+    ctx->key_region = allocate_secure_region(key_len, PROT_READ | PROT_WRITE);
+    if (!ctx->key_region) goto fail;
+    ctx->key_region_size = ((key_len + sysconf(_SC_PAGESIZE) - 1) / sysconf(_SC_PAGESIZE)) * sysconf(_SC_PAGESIZE);
+    memcpy(ctx->key_region, key, key_len);
     ctx->key_len = key_len;
+    // Скрываем ключ после инициализации
+    toggle_protection(ctx->key_region, ctx->key_region_size, PROT_NONE);
 
-    // Копируем соль (16 байт)
     memcpy(ctx->salt, salt, SALT_SIZE);
 
-    // Выделяем защищённую память для состояния RC4 (256 байт)
-    ctx->state = allocate_secure_memory(RC4_STATE_SIZE);
-    if (!ctx->state) {
-        clear_secure_rc4(ctx); // Очистка уже выделенных ресурсов
-        return NULL;
-    }
+    // Состояние
+    ctx->state_region = allocate_secure_region(RC4_STATE_SIZE + 2, PROT_READ | PROT_WRITE);
+    if (!ctx->state_region) goto fail;
+    ctx->state_region_size = ((RC4_STATE_SIZE + 2 + sysconf(_SC_PAGESIZE) - 1) / sysconf(_SC_PAGESIZE)) * sysconf(_SC_PAGESIZE);
+    
+    // KSA
+    uint8_t* S = ctx->state_region;
+    for (int i = 0; i < RC4_STATE_SIZE; i++) S[i] = (uint8_t)i;
 
-    // Инициализация S‑блока RC4
-    for (int i = 0; i < RC4_STATE_SIZE; i++) {
-        ctx->state[i] = (uint8_t)i;
-    }
-
-    // KSA (Key Scheduling Algorithm)
-    uint8_t tmp;
+    uint8_t* tmp_key = (uint8_t*)ctx->key_region;
+    toggle_protection(ctx->key_region, ctx->key_region_size, PROT_READ); // Временно открываем ключ
     size_t j = 0;
     for (size_t i = 0; i < RC4_STATE_SIZE; i++) {
-        j = (j + ctx->state[i] + ctx->key[i % ctx->key_len]) % RC4_STATE_SIZE;
-        tmp = ctx->state[i];
-        ctx->state[i] = ctx->state[j];
-        ctx->state[j] = tmp;
+        j = (j + S[i] + tmp_key[i % ctx->key_len]) % RC4_STATE_SIZE;
+        uint8_t t = S[i]; S[i] = S[j]; S[j] = t;
     }
+    toggle_protection(ctx->key_region, ctx->key_region_size, PROT_NONE); // Закрываем
 
-    ctx->i = 0;
-    ctx->j = 0;
+    ctx->state_region[RC4_STATE_SIZE] = 0; // i
+    ctx->state_region[RC4_STATE_SIZE + 1] = 0; // j
+    toggle_protection(ctx->state_region, ctx->state_region_size, PROT_NONE); // Скрываем состояние
 
     return ctx;
+
+fail:
+    clear_secure_rc4(ctx);
+    return NULL;
 }
 
 int rc4_crypt(secure_rc4_context* ctx, const void* src, void* dst, size_t len) {
     if (!ctx || !src || !dst || len == 0) return -1;
 
+    pthread_mutex_lock(&ctx->state_mutex);
+    toggle_protection(ctx->state_region, ctx->state_region_size, PROT_READ | PROT_WRITE);
+
     const uint8_t* s = (const uint8_t*)src;
     uint8_t* d = (uint8_t*)dst;
-    uint8_t tmp;
+    uint8_t* S = ctx->state_region;
+    uint8_t a = ctx->state_region[RC4_STATE_SIZE];
+    uint8_t b = ctx->state_region[RC4_STATE_SIZE + 1];
 
     for (size_t n = 0; n < len; n++) {
-        // PRGA (Pseudo-Random Generation Algorithm)
-        ctx->i = (ctx->i + 1) % RC4_STATE_SIZE;
-        ctx->j = (ctx->j + ctx->state[ctx->i]) % RC4_STATE_SIZE;
-
-        tmp = ctx->state[ctx->i];
-        ctx->state[ctx->i] = ctx->state[ctx->j];
-        ctx->state[ctx->j] = tmp;
-
-        uint8_t k = ctx->state[(ctx->state[ctx->i] + ctx->state[ctx->j]) % RC4_STATE_SIZE];
-        d[n] = s[n] ^ k;
+        a = (a + 1) & 0xFF;
+        b = (b + S[a]) & 0xFF;
+        uint8_t t = S[a]; S[a] = S[b]; S[b] = t;
+        d[n] = s[n] ^ S[(S[a] + S[b]) & 0xFF];
     }
 
+    ctx->state_region[RC4_STATE_SIZE] = a;
+    ctx->state_region[RC4_STATE_SIZE + 1] = b;
+    toggle_protection(ctx->state_region, ctx->state_region_size, PROT_NONE);
+    pthread_mutex_unlock(&ctx->state_mutex);
     return 0;
 }
 
@@ -105,16 +107,18 @@ const uint8_t* get_salt(const secure_rc4_context* ctx) {
 
 void clear_secure_rc4(secure_rc4_context* ctx) {
     if (!ctx) return;
-
-    if (ctx->key) {
-        secure_memset(ctx->key, 0, ctx->key_len);
-        munmap(ctx->key, ctx->key_len);
+    
+    if (ctx->key_region) {
+        if (mprotect(ctx->key_region, ctx->key_region_size, PROT_READ | PROT_WRITE) == 0)
+            secure_memset(ctx->key_region, 0, ctx->key_len);
+        munmap(ctx->key_region, ctx->key_region_size);
     }
-
-    if (ctx->state) {
-        secure_memset(ctx->state, 0, RC4_STATE_SIZE);
-        munmap(ctx->state, RC4_STATE_SIZE);
+    if (ctx->state_region) {
+        if (mprotect(ctx->state_region, ctx->state_region_size, PROT_READ | PROT_WRITE) == 0)
+            secure_memset(ctx->state_region, 0, RC4_STATE_SIZE + 2);
+        munmap(ctx->state_region, ctx->state_region_size);
     }
-
+    pthread_mutex_destroy(&ctx->state_mutex);
+    secure_memset(ctx, 0, sizeof(*ctx));
     free(ctx);
 }

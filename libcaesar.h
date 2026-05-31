@@ -21,7 +21,7 @@ typedef struct {
 } secure_rc4_context;
 
 // Инициализация защищённого контекста RC4
-secure_rc4_context* init_secure_rc4(const uint8_t* key, size_t key_len, const uint8_t* salt);
+secure_rc4_context* init_secure_rc4(const uint8_t* key, size_t key_len, const uint8_t>
 
 // Шифрование/дешифрование (RC4 симметричен)
 int rc4_crypt(secure_rc4_context* ctx, const void* src, void* dst, size_t len);

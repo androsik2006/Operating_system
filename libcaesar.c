@@ -1,6 +1,7 @@
 #include "libcaesar.h"
 #include <sys/mman.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -41,8 +42,11 @@ secure_rc4_context* init_secure_rc4(const uint8_t* key, size_t key_len, const ui
     ctx->key_region_size = ((key_len + sysconf(_SC_PAGESIZE) - 1) / sysconf(_SC_PAGESIZE)) * sysconf(_SC_PAGESIZE);
     memcpy(ctx->key_region, key, key_len);
     ctx->key_len = key_len;
-    // Скрываем ключ после инициализации
-    toggle_protection(ctx->key_region, ctx->key_region_size, PROT_NONE);
+    // Скрываем ключ после копирования
+    if (toggle_protection(ctx->key_region, ctx->key_region_size, PROT_NONE) != 0) {
+        fprintf(stderr, "mprotect(key, NONE) failed: %s\n", strerror(errno));
+        goto fail;
+    }
 
     memcpy(ctx->salt, salt, SALT_SIZE);
 
@@ -56,17 +60,26 @@ secure_rc4_context* init_secure_rc4(const uint8_t* key, size_t key_len, const ui
     for (int i = 0; i < RC4_STATE_SIZE; i++) S[i] = (uint8_t)i;
 
     uint8_t* tmp_key = (uint8_t*)ctx->key_region;
-    toggle_protection(ctx->key_region, ctx->key_region_size, PROT_READ); // Временно открываем ключ
+    if (toggle_protection(ctx->key_region, ctx->key_region_size, PROT_READ) != 0) { // Временно открываем ключ
+        fprintf(stderr, "mprotect(key, READ) failed: %s\n", strerror(errno));
+        goto fail;
+    }
     size_t j = 0;
     for (size_t i = 0; i < RC4_STATE_SIZE; i++) {
         j = (j + S[i] + tmp_key[i % ctx->key_len]) % RC4_STATE_SIZE;
         uint8_t t = S[i]; S[i] = S[j]; S[j] = t;
     }
-    toggle_protection(ctx->key_region, ctx->key_region_size, PROT_NONE); // Закрываем
+    if (toggle_protection(ctx->key_region, ctx->key_region_size, PROT_NONE) != 0) { // Закрываем
+        fprintf(stderr, "mprotect(key, NONE) after KSA failed: %s\n", strerror(errno));
+        goto fail;
+    }
 
     ctx->state_region[RC4_STATE_SIZE] = 0; // i
     ctx->state_region[RC4_STATE_SIZE + 1] = 0; // j
-    toggle_protection(ctx->state_region, ctx->state_region_size, PROT_NONE); // Скрываем состояние
+    if (toggle_protection(ctx->state_region, ctx->state_region_size, PROT_NONE) != 0) { // Скрываем состояние
+        fprintf(stderr, "mprotect(state, NONE) failed: %s\n", strerror(errno));
+        goto fail;
+    }
 
     return ctx;
 
@@ -79,7 +92,10 @@ int rc4_crypt(secure_rc4_context* ctx, const void* src, void* dst, size_t len) {
     if (!ctx || !src || !dst || len == 0) return -1;
 
     pthread_mutex_lock(&ctx->state_mutex);
-    toggle_protection(ctx->state_region, ctx->state_region_size, PROT_READ | PROT_WRITE);
+    if (toggle_protection(ctx->state_region, ctx->state_region_size, PROT_READ | PROT_WRITE) != 0) {
+        pthread_mutex_unlock(&ctx->state_mutex);
+        return -1;
+    }
 
     const uint8_t* s = (const uint8_t*)src;
     uint8_t* d = (uint8_t*)dst;
@@ -96,7 +112,9 @@ int rc4_crypt(secure_rc4_context* ctx, const void* src, void* dst, size_t len) {
 
     ctx->state_region[RC4_STATE_SIZE] = a;
     ctx->state_region[RC4_STATE_SIZE + 1] = b;
-    toggle_protection(ctx->state_region, ctx->state_region_size, PROT_NONE);
+    if (toggle_protection(ctx->state_region, ctx->state_region_size, PROT_NONE) != 0) {
+        /* Состояние уже обновлено, ошибка mprotect некритична для корректности */
+    }
     pthread_mutex_unlock(&ctx->state_mutex);
     return 0;
 }
